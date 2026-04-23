@@ -70,6 +70,45 @@ impl Value {
             _ => 0.0,
         }
     }
+    /// Parse a CSS `box-shadow` value into (offset_x, offset_y, blur, spread, color).
+    /// Only supports a single shadow; accepts 2-4 lengths plus an optional color.
+    /// Returns None for `none` or unparsable input.
+    pub fn to_shadow(&self) -> Option<(f32, f32, f32, f32, Color)> {
+        if let Value::Keyword(k) = self {
+            if k == "none" {
+                return None;
+            }
+        }
+        let items = self.as_list();
+        let mut lens: Vec<f32> = Vec::new();
+        let mut color: Option<Color> = None;
+        for v in &items {
+            match v {
+                Value::Length(n, _) | Value::Number(n) => lens.push(*n),
+                Value::Color(c) => color = Some(*c),
+                _ => {}
+            }
+        }
+        if lens.len() < 2 {
+            return None;
+        }
+        let ox = lens[0];
+        let oy = lens[1];
+        let blur = lens.get(2).copied().unwrap_or(0.0);
+        let spread = lens.get(3).copied().unwrap_or(0.0);
+        Some((
+            ox,
+            oy,
+            blur,
+            spread,
+            color.unwrap_or(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 128,
+            }),
+        ))
+    }
     pub fn to_number(&self) -> Option<f32> {
         match self {
             Value::Number(v) => Some(*v),

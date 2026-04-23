@@ -1,21 +1,26 @@
 //! MVP browser engine CLI: input.html -> output.png
 //!
 //! Pipeline: HTML parse -> DOM -> CSS parse (UA + <style>) -> styled tree ->
-//!           block layout -> paint via tiny-skia -> PNG.
+//!           block/inline/flex layout with positioning -> paint via tiny-skia -> PNG.
 
 mod html;
 mod css;
 mod style;
 mod layout;
 mod paint;
+mod text;
 
 use std::path::PathBuf;
 
-use layout::{LayoutEngine, Rect};
+use layout::{FontFace, FontSet, LayoutEngine, Rect};
 
-// Bundled font: DejaVu-like TTF. We use a minimal embedded font to avoid system deps.
-// For simplicity, load a font at runtime if provided via FONT env var; otherwise fallback to bundled.
-static DEFAULT_FONT: &[u8] = include_bytes!("../assets/font.ttf");
+// Bundled fonts. We ship a Sans family (regular + bold + italic), a Serif,
+// and a Monospace so `font-family` fallback actually changes the render.
+static FONT_SANS: &[u8] = include_bytes!("../assets/font.ttf");
+static FONT_SANS_BOLD: &[u8] = include_bytes!("../assets/font-bold.ttf");
+static FONT_SANS_ITALIC: &[u8] = include_bytes!("../assets/font-italic.ttf");
+static FONT_SERIF: &[u8] = include_bytes!("../assets/font-serif.ttf");
+static FONT_MONO: &[u8] = include_bytes!("../assets/font-mono.ttf");
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,33 +44,66 @@ fn main() {
     // 3. Build styled tree
     let styled = style::style_tree(&dom, &stylesheet);
 
-    // 4. Load font
-    let font_bytes = std::env::var("BROWSER_FONT")
-        .ok()
-        .and_then(|p| std::fs::read(p).ok())
-        .unwrap_or_else(|| DEFAULT_FONT.to_vec());
-    let font = fontdue::Font::from_bytes(font_bytes.clone(), fontdue::FontSettings::default())
-        .expect("font parse");
-    // Bold font: use $BROWSER_BOLD_FONT if set, else reuse regular. Paint applies
-    // a synthetic-bold second pass when the font lacks a real bold weight.
-    let bold_font_bytes = std::env::var("BROWSER_BOLD_FONT")
-        .ok()
-        .and_then(|p| std::fs::read(p).ok())
-        .unwrap_or(font_bytes);
-    let bold_font =
-        fontdue::Font::from_bytes(bold_font_bytes, fontdue::FontSettings::default())
-            .expect("bold font parse");
+    // 4. Load fonts. Each face carries both a fontdue::Font (rasterizer)
+    //    and a rustybuzz::Face (shaper) built from the same bytes so the
+    //    glyph indices agree. An override env var `BROWSER_FONT` lets
+    //    callers swap the regular sans face with any TTF.
+    let sans_bytes = load_bytes("BROWSER_FONT", FONT_SANS);
+    let sans_bold_bytes = load_bytes("BROWSER_BOLD_FONT", FONT_SANS_BOLD);
+    let sans_italic_bytes = load_bytes("BROWSER_ITALIC_FONT", FONT_SANS_ITALIC);
+    let serif_bytes = load_bytes("BROWSER_SERIF_FONT", FONT_SERIF);
+    let mono_bytes = load_bytes("BROWSER_MONO_FONT", FONT_MONO);
+
+    let sans = make_fontdue(&sans_bytes, "sans");
+    let sans_bold = make_fontdue(&sans_bold_bytes, "sans-bold");
+    let sans_italic = make_fontdue(&sans_italic_bytes, "sans-italic");
+    let serif = make_fontdue(&serif_bytes, "serif");
+    let mono = make_fontdue(&mono_bytes, "mono");
+
+    let fonts = FontSet {
+        sans: FontFace {
+            fontdue: &sans,
+            buzz: rustybuzz::Face::from_slice(&sans_bytes, 0).expect("sans buzz"),
+        },
+        sans_bold: FontFace {
+            fontdue: &sans_bold,
+            buzz: rustybuzz::Face::from_slice(&sans_bold_bytes, 0).expect("sans-bold buzz"),
+        },
+        sans_italic: FontFace {
+            fontdue: &sans_italic,
+            buzz: rustybuzz::Face::from_slice(&sans_italic_bytes, 0).expect("sans-italic buzz"),
+        },
+        serif: FontFace {
+            fontdue: &serif,
+            buzz: rustybuzz::Face::from_slice(&serif_bytes, 0).expect("serif buzz"),
+        },
+        mono: FontFace {
+            fontdue: &mono,
+            buzz: rustybuzz::Face::from_slice(&mono_bytes, 0).expect("mono buzz"),
+        },
+    };
 
     // 5. Layout
     let engine = LayoutEngine {
         viewport: Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 },
-        font: &font,
-        bold_font: &bold_font,
+        fonts: &fonts,
     };
     let layout_root = engine.layout(&styled);
 
     // 6. Paint to PNG
-    let pm = paint::paint(&layout_root, width, height, &font, &bold_font);
+    let pm = paint::paint(&layout_root, width, height, &fonts);
     pm.save_png(&output_path).expect("save png");
     println!("rendered {} -> {} ({}x{})", input_path.display(), output_path.display(), width, height);
+}
+
+fn load_bytes(env_var: &str, fallback: &[u8]) -> Vec<u8> {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_else(|| fallback.to_vec())
+}
+
+fn make_fontdue(bytes: &[u8], label: &str) -> fontdue::Font {
+    fontdue::Font::from_bytes(bytes.to_vec(), fontdue::FontSettings::default())
+        .unwrap_or_else(|e| panic!("font parse ({}): {:?}", label, e))
 }

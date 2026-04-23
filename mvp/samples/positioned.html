@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: sans-serif; background: #f4f6fa; margin: 0; padding: 24px; color: #0f172a; }
+  h1 { font-size: 28px; margin: 0 0 8px 0; color: #0f172a; }
+  .lead { font-style: italic; color: #475569; margin: 0 0 24px 0; font-size: 15px; }
+
+  /* Stacked, positioned cards */
+  .stage {
+    position: relative;
+    width: 680px;
+    height: 360px;
+    background: #ffffff;
+    border-radius: 16px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.15);
+    padding: 20px;
+  }
+
+  .badge {
+    position: absolute;
+    top: -12px;
+    right: 20px;
+    width: 60px;
+    background: #ef4444;
+    color: white;
+    font-weight: bold;
+    font-size: 13px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    box-shadow: 0 4px 10px rgba(239, 68, 68, 0.4);
+    z-index: 10;
+    text-align: center;
+  }
+
+  .card {
+    position: absolute;
+    width: 220px;
+    height: 140px;
+    border-radius: 14px;
+    padding: 16px;
+    color: white;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    font-family: serif;
+  }
+  .title { margin: 0 0 8px 0; font-size: 20px; font-weight: bold; color: white; }
+  .sub { margin: 0; font-size: 14px; font-style: italic; color: white; opacity: 0.95; }
+
+  .c1 { left: 24px;  top: 50px;  background: #3b82f6; z-index: 1; }
+  .c2 { left: 160px; top: 100px; background: #8b5cf6; z-index: 2; }
+  .c3 { left: 296px; top: 150px; background: #ec4899; z-index: 3; }
+
+  .tag {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    width: 180px;
+    background: #0f172a;
+    color: #e2e8f0;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  .fade {
+    position: absolute;
+    right: 24px;
+    bottom: 20px;
+    width: 180px;
+    padding: 12px;
+    background: #10b981;
+    color: white;
+    border-radius: 10px;
+    opacity: 0.75;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+  <h1>Positioned layout</h1>
+  <p class="lead">Absolute cards, z-index stacking, italic text, shadows, and opacity — all in the M3 engine.</p>
+  <div class="stage">
+    <div class="badge">NEW</div>
+    <div class="card c1"><div class="title">One</div><div class="sub">behind the others</div></div>
+    <div class="card c2"><div class="title">Two</div><div class="sub">middle of the stack</div></div>
+    <div class="card c3"><div class="title">Three</div><div class="sub">on top, z-index 3</div></div>
+    <div class="tag">position: absolute</div>
+    <div class="fade">This panel is opacity: 0.75 — it lets the stage shine through.</div>
+  </div>
+</body>
+</html>

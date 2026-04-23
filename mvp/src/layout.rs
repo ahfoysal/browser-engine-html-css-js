@@ -1,10 +1,14 @@
-//! Layout engine. M2 adds borders to the box model, flexbox-lite
-//! (`display: flex` with `flex-direction`, `justify-content`, `align-items`,
-//! `gap` — single-line only), per-line baselines, `text-align`, `line-height`,
-//! and `font-weight`.
+//! Layout engine. M3 adds CSS positioning (`relative`, `absolute`, `fixed`),
+//! `top/left/right/bottom`, `z-index`, `opacity`, `box-shadow`, real
+//! `font-family` fallback lists, `font-style: italic`, and rustybuzz text
+//! shaping for proper kerning.
+//!
+//! Earlier milestones added borders, `border-radius`, flexbox-lite, inline
+//! layout with line boxes, `text-align`, `line-height`, and `font-weight`.
 
 use crate::css::{Color, Value};
 use crate::style::{Display, StyledNode};
+use crate::text;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Rect {
@@ -76,6 +80,38 @@ fn expand(r: Rect, e: EdgeSizes) -> Rect {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Position::Static
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Offsets {
+    pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    pub left: Option<f32>,
+}
+
+/// Drop-shadow specification resolved from the `box-shadow` property.
+#[derive(Debug, Clone, Copy)]
+pub struct Shadow {
+    pub ox: f32,
+    pub oy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
     pub dimensions: Dimensions,
@@ -86,6 +122,11 @@ pub struct LayoutBox {
     pub borders: Borders,
     pub radii: Radii,
     pub bg: Option<Color>,
+    pub position: Position,
+    pub offsets: Offsets,
+    pub z_index: i32,
+    pub opacity: f32,
+    pub shadow: Option<Shadow>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +153,28 @@ pub struct InlineItem {
     pub font_size: f32,
     pub color: Color,
     pub bold: bool,
+    pub italic: bool,
+    /// Which bundled font family was resolved for this run. Paint uses this
+    /// to pick the right fontdue face — lets `font-family: serif` and
+    /// `font-family: monospace` render with visually distinct glyphs.
+    pub family: FontFamily,
+    /// Pre-shaped glyphs: indices + per-glyph x positions in pixels,
+    /// relative to `x`. Populated during layout via rustybuzz so paint
+    /// gets proper kerning for free.
+    pub glyphs: Vec<text::ShapedGlyph>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFamily {
+    Sans,
+    Serif,
+    Monospace,
+}
+
+impl Default for FontFamily {
+    fn default() -> Self {
+        FontFamily::Sans
+    }
 }
 
 fn px(node: &StyledNode, key: &str, default: f32) -> f32 {
@@ -186,6 +249,83 @@ fn resolve_borders(node: &StyledNode) -> Borders {
     }
 }
 
+fn resolve_position(node: &StyledNode) -> (Position, Offsets) {
+    let pos = match keyword(node, "position").as_deref() {
+        Some("relative") => Position::Relative,
+        Some("absolute") => Position::Absolute,
+        Some("fixed") => Position::Fixed,
+        _ => Position::Static,
+    };
+    let side = |name: &str| -> Option<f32> {
+        node.lookup(name).map(|v| v.to_px())
+    };
+    let offsets = Offsets {
+        top: side("top"),
+        right: side("right"),
+        bottom: side("bottom"),
+        left: side("left"),
+    };
+    (pos, offsets)
+}
+
+fn resolve_z_index(node: &StyledNode) -> i32 {
+    node.lookup("z-index")
+        .and_then(|v| v.to_number())
+        .map(|n| n as i32)
+        .unwrap_or(0)
+}
+
+fn resolve_opacity(node: &StyledNode) -> f32 {
+    node.lookup("opacity")
+        .and_then(|v| v.to_number())
+        .map(|n| n.clamp(0.0, 1.0))
+        .unwrap_or(1.0)
+}
+
+fn resolve_shadow(node: &StyledNode) -> Option<Shadow> {
+    let v = node.lookup("box-shadow")?;
+    let (ox, oy, blur, spread, color) = v.to_shadow()?;
+    Some(Shadow {
+        ox,
+        oy,
+        blur,
+        spread,
+        color,
+    })
+}
+
+/// Inherit the resolved `font-family` from the CSS keyword, walking the
+/// comma-separated fallback list. Recognises `serif`, `monospace`,
+/// `sans-serif`; anything else falls through to sans (we don't ship named
+/// fonts like "Georgia").
+pub fn resolve_family(node: &StyledNode) -> FontFamily {
+    if let Some(v) = node.lookup("font-family") {
+        for item in v.as_list() {
+            if let Some(k) = item.to_keyword() {
+                match k {
+                    "serif" | "georgia" | "times" | "cambria" => return FontFamily::Serif,
+                    "monospace" | "mono" | "courier" | "menlo" | "consolas" => {
+                        return FontFamily::Monospace
+                    }
+                    "sans-serif" | "sans" | "arial" | "helvetica" => return FontFamily::Sans,
+                    _ => {}
+                }
+            }
+        }
+    }
+    FontFamily::Sans
+}
+
+fn is_italic(node: &StyledNode) -> bool {
+    if let Some(k) = keyword(node, "font-style") {
+        return k == "italic" || k == "oblique";
+    }
+    if let StyledNode::Element { tag, .. } = node {
+        return matches!(tag.as_str(), "i" | "em" | "cite" | "var");
+    }
+    false
+}
+
 fn resolve_radii(node: &StyledNode) -> Radii {
     Radii {
         tl: px(node, "border-top-left-radius", 0.0),
@@ -195,10 +335,46 @@ fn resolve_radii(node: &StyledNode) -> Radii {
     }
 }
 
+/// Bundle of fonts used by the engine. `FontSet` holds both the fontdue
+/// face (used for rasterization) and the rustybuzz face (used for shaping)
+/// for every (family, weight, style) combination we support.
+pub struct FontSet<'a> {
+    pub sans: FontFace<'a>,
+    pub sans_bold: FontFace<'a>,
+    pub sans_italic: FontFace<'a>,
+    pub serif: FontFace<'a>,
+    pub mono: FontFace<'a>,
+}
+
+pub struct FontFace<'a> {
+    pub fontdue: &'a fontdue::Font,
+    pub buzz: rustybuzz::Face<'a>,
+}
+
+impl<'a> FontSet<'a> {
+    /// Pick the face that best matches the requested family/weight/style.
+    /// We fall back through sans regular for anything we don't bundle —
+    /// bold italic, for example, degrades to plain italic.
+    pub fn pick(&self, family: FontFamily, bold: bool, italic: bool) -> &FontFace<'a> {
+        match family {
+            FontFamily::Serif => &self.serif,
+            FontFamily::Monospace => &self.mono,
+            FontFamily::Sans => {
+                if italic {
+                    &self.sans_italic
+                } else if bold {
+                    &self.sans_bold
+                } else {
+                    &self.sans
+                }
+            }
+        }
+    }
+}
+
 pub struct LayoutEngine<'a> {
     pub viewport: Rect,
-    pub font: &'a fontdue::Font,
-    pub bold_font: &'a fontdue::Font,
+    pub fonts: &'a FontSet<'a>,
 }
 
 impl<'a> LayoutEngine<'a> {
@@ -219,19 +395,117 @@ impl<'a> LayoutEngine<'a> {
                 ..Default::default()
             },
         );
+        // Post-process: resolve `position: relative` offsets (shift in place)
+        // and `position: absolute/fixed` boxes (reparent to nearest positioned
+        // ancestor or the viewport).
+        self.resolve_positioning(&mut lb);
         lb
     }
 
+    /// Walk the layout tree applying positioning adjustments. Relative boxes
+    /// are translated by their top/left offsets. Absolute/fixed boxes are
+    /// already laid out in their original document position as a flow box —
+    /// we now detach them from their current parent's contribution and
+    /// translate to the positioning container.
+    fn resolve_positioning(&self, root: &mut LayoutBox) {
+        // Collect positioning containers: root (viewport) acts as initial
+        // containing block.
+        let vp = self.viewport;
+        Self::apply_positioning(root, vp, vp);
+    }
+
+    fn apply_positioning(lb: &mut LayoutBox, initial_cb: Rect, viewport: Rect) {
+        // Determine containing block for this box's children:
+        // - If this box is positioned (relative/absolute/fixed) it becomes
+        //   the containing block for descendants using its padding box.
+        let my_pb = lb.dimensions.padding_box();
+        let child_cb = if lb.position != Position::Static {
+            my_pb
+        } else {
+            initial_cb
+        };
+
+        // Recurse first so inner abs children are repositioned relative to
+        // their nearest positioned ancestor.
+        for c in &mut lb.children {
+            Self::apply_positioning(c, child_cb, viewport);
+        }
+
+        // Apply our own position adjustments using `initial_cb` (the
+        // containing block our parent passed down).
+        match lb.position {
+            Position::Static => {}
+            Position::Relative => {
+                let dx = lb.offsets.left.unwrap_or_else(|| {
+                    lb.offsets.right.map(|r| -r).unwrap_or(0.0)
+                });
+                let dy = lb.offsets.top.unwrap_or_else(|| {
+                    lb.offsets.bottom.map(|b| -b).unwrap_or(0.0)
+                });
+                if dx != 0.0 || dy != 0.0 {
+                    translate_box(lb, dx, dy);
+                }
+            }
+            Position::Absolute | Position::Fixed => {
+                let cb = if lb.position == Position::Fixed {
+                    viewport
+                } else {
+                    initial_cb
+                };
+                // Current margin-box position:
+                let mb = lb.dimensions.margin_box();
+                let target_x = if let Some(l) = lb.offsets.left {
+                    cb.x + l
+                } else if let Some(r) = lb.offsets.right {
+                    cb.x + cb.w - r - mb.w
+                } else {
+                    mb.x
+                };
+                let target_y = if let Some(t) = lb.offsets.top {
+                    cb.y + t
+                } else if let Some(b) = lb.offsets.bottom {
+                    cb.y + cb.h - b - mb.h
+                } else {
+                    mb.y
+                };
+                let dx = target_x - mb.x;
+                let dy = target_y - mb.y;
+                if dx != 0.0 || dy != 0.0 {
+                    translate_box(lb, dx, dy);
+                }
+            }
+        }
+    }
+
     fn build_box(&self, node: &StyledNode) -> LayoutBox {
-        let (borders, radii, bg) = match node {
+        let (borders, radii, bg, position, offsets, z, opacity, shadow) = match node {
             StyledNode::Element { .. } => {
                 let bg = node
                     .lookup("background-color")
                     .and_then(|v| v.to_color())
                     .or_else(|| node.lookup("background").and_then(|v| v.to_color()));
-                (resolve_borders(node), resolve_radii(node), bg)
+                let (position, offsets) = resolve_position(node);
+                (
+                    resolve_borders(node),
+                    resolve_radii(node),
+                    bg,
+                    position,
+                    offsets,
+                    resolve_z_index(node),
+                    resolve_opacity(node),
+                    resolve_shadow(node),
+                )
             }
-            _ => (Borders::default(), Radii::default(), None),
+            _ => (
+                Borders::default(),
+                Radii::default(),
+                None,
+                Position::Static,
+                Offsets::default(),
+                0,
+                1.0,
+                None,
+            ),
         };
         LayoutBox {
             dimensions: Dimensions::default(),
@@ -241,6 +515,11 @@ impl<'a> LayoutEngine<'a> {
             borders,
             radii,
             bg,
+            position,
+            offsets,
+            z_index: z,
+            opacity,
+            shadow,
         }
     }
 
@@ -331,6 +610,20 @@ impl<'a> LayoutEngine<'a> {
             }
             return;
         }
+
+        // Partition: absolutely-positioned (including fixed) children don't
+        // participate in the normal flow, but they still need to be laid out
+        // so we can size them. We layout them separately and attach as
+        // children — the positioning pass will place them.
+        let (flow_children, out_of_flow): (Vec<StyledNode>, Vec<StyledNode>) = children_nodes
+            .into_iter()
+            .partition(|c| {
+                !matches!(
+                    keyword(c, "position").as_deref(),
+                    Some("absolute") | Some("fixed")
+                )
+            });
+        let children_nodes = flow_children;
 
         let all_inline = !children_nodes.is_empty()
             && children_nodes.iter().all(|c| c.display() == Display::Inline);
@@ -428,6 +721,25 @@ impl<'a> LayoutEngine<'a> {
         } else if !all_inline {
             lb.dimensions.content.h = (cursor_y - lb.dimensions.content.y).max(0.0);
         }
+
+        // Layout out-of-flow children (absolute/fixed). They sit at their
+        // source-order "current" cursor position; the positioning pass will
+        // later move them to their actual offset. Sizing uses the current
+        // box as a starting containing block.
+        for child in &out_of_flow {
+            let mut cb = self.build_box(child);
+            let cont = Dimensions {
+                content: Rect {
+                    x: lb.dimensions.content.x,
+                    y: lb.dimensions.content.y,
+                    w: lb.dimensions.content.w,
+                    h: 0.0,
+                },
+                ..Default::default()
+            };
+            self.layout_block(&mut cb, &cont);
+            lb.children.push(cb);
+        }
     }
 
     /// Build line boxes from inline children.
@@ -443,6 +755,8 @@ impl<'a> LayoutEngine<'a> {
                 a: 255,
             },
         );
+        let parent_family = resolve_family(node);
+        let parent_italic = is_italic(node);
         // line-height: unitless multiplier OR length in px
         let line_height = match node.lookup("line-height") {
             Some(Value::Number(n)) => font_size * n,
@@ -465,6 +779,8 @@ impl<'a> LayoutEngine<'a> {
             fs: f32,
             col: Color,
             bold: bool,
+            italic: bool,
+            family: FontFamily,
             // true if this token is just whitespace (a separator that may collapse at line breaks)
             ws: bool,
         }
@@ -473,6 +789,8 @@ impl<'a> LayoutEngine<'a> {
             parent_fs: f32,
             parent_col: Color,
             parent_bold: bool,
+            parent_italic: bool,
+            parent_family: FontFamily,
             out: &mut Vec<Tok>,
         ) {
             match child {
@@ -491,6 +809,8 @@ impl<'a> LayoutEngine<'a> {
                             fs: parent_fs,
                             col: parent_col,
                             bold: parent_bold,
+                            italic: parent_italic,
+                            family: parent_family,
                             ws: true,
                         });
                     }
@@ -503,6 +823,8 @@ impl<'a> LayoutEngine<'a> {
                                         fs: parent_fs,
                                         col: parent_col,
                                         bold: parent_bold,
+                                        italic: parent_italic,
+                                        family: parent_family,
                                         ws: false,
                                     });
                                 }
@@ -533,6 +855,8 @@ impl<'a> LayoutEngine<'a> {
                                             fs: parent_fs,
                                             col: parent_col,
                                             bold: parent_bold,
+                                            italic: parent_italic,
+                                            family: parent_family,
                                             ws: true,
                                         });
                                     }
@@ -548,6 +872,8 @@ impl<'a> LayoutEngine<'a> {
                             fs: parent_fs,
                             col: parent_col,
                             bold: parent_bold,
+                            italic: parent_italic,
+                            family: parent_family,
                             ws: false,
                         });
                     }
@@ -560,6 +886,8 @@ impl<'a> LayoutEngine<'a> {
                                 fs: parent_fs,
                                 col: parent_col,
                                 bold: parent_bold,
+                                italic: parent_italic,
+                                family: parent_family,
                                 ws: true,
                             });
                         }
@@ -575,8 +903,15 @@ impl<'a> LayoutEngine<'a> {
                         .and_then(|v| v.to_color())
                         .unwrap_or(parent_col);
                     let bold = is_bold(child) || parent_bold;
+                    let italic = is_italic(child) || parent_italic;
+                    // Inherit family from child if set, else parent.
+                    let family = if child.lookup("font-family").is_some() {
+                        resolve_family(child)
+                    } else {
+                        parent_family
+                    };
                     for gc in children {
-                        flatten(gc, fs, col, bold, out);
+                        flatten(gc, fs, col, bold, italic, family, out);
                     }
                 }
             }
@@ -584,7 +919,15 @@ impl<'a> LayoutEngine<'a> {
 
         let mut toks: Vec<Tok> = Vec::new();
         for c in children {
-            flatten(c, font_size, text_color, parent_bold, &mut toks);
+            flatten(
+                c,
+                font_size,
+                text_color,
+                parent_bold,
+                parent_italic,
+                parent_family,
+                &mut toks,
+            );
         }
 
         // Line break: iterate tokens, measure, wrap when exceeding content width.
@@ -633,19 +976,17 @@ impl<'a> LayoutEngine<'a> {
             };
 
         for tok in &toks {
-            // Measure this token (pick bold or regular font).
-            let font = if tok.bold { self.bold_font } else { self.font };
-            let w = measure_text(font, &tok.text, tok.fs);
+            // Shape via rustybuzz — picks up kerning + ligatures for free.
+            let face = self.fonts.pick(tok.family, tok.bold, tok.italic);
+            let (glyphs, w) = text::shape(&face.buzz, &tok.text, tok.fs);
             let is_leading_ws = tok.ws && cur.items.is_empty();
             if is_leading_ws {
                 continue;
             }
             if cur_x + w > content_right && !cur.items.is_empty() {
                 // wrap
-                // drop trailing whitespace we'd carry into next line
                 flush_line(&mut lines, &mut cur, &mut cur_max_fs, &mut cursor_y);
                 cur_x = content_left;
-                // collapse: leading whitespace on the wrapped line is dropped
                 if tok.ws {
                     continue;
                 }
@@ -658,6 +999,9 @@ impl<'a> LayoutEngine<'a> {
                 font_size: tok.fs,
                 color: tok.col,
                 bold: tok.bold,
+                italic: tok.italic,
+                family: tok.family,
+                glyphs,
             });
             cur_x += w;
             if tok.fs > cur_max_fs {

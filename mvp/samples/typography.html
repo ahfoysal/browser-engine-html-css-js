@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { background: #fbfaf6; margin: 0; padding: 32px; font-family: serif; color: #1f2937; }
+  .page {
+    position: relative;
+    width: 720px;
+    background: white;
+    padding: 40px 48px;
+    border-radius: 8px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.08);
+  }
+
+  .eyebrow {
+    font-family: monospace;
+    font-size: 12px;
+    color: #6b7280;
+    margin: 0 0 8px 0;
+  }
+  h1 {
+    font-family: serif;
+    font-size: 36px;
+    margin: 0 0 4px 0;
+    color: #111827;
+  }
+  .byline {
+    font-style: italic;
+    color: #6b7280;
+    font-size: 14px;
+    margin: 0 0 28px 0;
+  }
+
+  p {
+    font-family: serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 14px 0;
+  }
+
+  em { font-style: italic; color: #1f2937; }
+  strong { font-weight: bold; }
+  code {
+    font-family: monospace;
+    background: #f3f4f6;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 14px;
+    color: #b91c1c;
+  }
+
+  .pullquote {
+    position: relative;
+    font-style: italic;
+    font-size: 20px;
+    color: #374151;
+    margin: 20px 0 20px 0;
+    padding: 16px 20px;
+    background: #fef3c7;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(180, 83, 9, 0.15);
+  }
+
+  .watermark {
+    position: absolute;
+    top: 32px;
+    right: 40px;
+    font-family: sans-serif;
+    font-size: 11px;
+    color: #9ca3af;
+    opacity: 0.7;
+  }
+
+  .chip {
+    position: relative;
+    top: -2px;
+    background: #6366f1;
+    color: white;
+    font-family: sans-serif;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 3px 8px;
+    border-radius: 999px;
+    box-shadow: 0 2px 6px rgba(99, 102, 241, 0.4);
+  }
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="watermark">M3 / typography</div>
+    <p class="eyebrow">ENGINEERING NOTES</p>
+    <h1>Shaping text, the hard way</h1>
+    <p class="byline">by a curious afternoon — April 2026</p>
+
+    <p>
+      Real typography needs a <strong>shaper</strong>. Without one, the
+      gap between AV is identical to the gap between AL, and the word
+      <em>Kerning</em> looks wrong in a way you can feel but cannot
+      quite name. The M3 engine uses <code>rustybuzz</code>, a pure-Rust
+      port of HarfBuzz, to do this work properly.
+    </p>
+
+    <div class="pullquote">
+      “A good shaper is invisible. You only notice its absence.”
+    </div>
+
+    <p>
+      Each inline run is converted into a stream of glyph ids with
+      precise <em>x-advances</em>. Those advances pick up pair kerning
+      automatically, which you can see in headings set at large sizes.
+      The ids are passed to <code>fontdue</code> for rasterization, and
+      the two libraries agree on the glyph table because they read the
+      same <code>.ttf</code> bytes. <span class="chip">NEW</span>
+    </p>
+
+    <p>
+      <strong>Font families</strong> fall back through the usual list:
+      <em>serif</em> resolves to DejaVu Serif, <em>monospace</em> to
+      DejaVu Sans Mono, everything else to DejaVu Sans. Italic runs —
+      like this one — use a real oblique face rather than a synthetic
+      slant. Bold remains a second-pass smear for now; a real bold
+      family is bundled and used automatically for <strong>strong</strong>
+      elements.
+    </p>
+  </div>
+</body>
+</html>

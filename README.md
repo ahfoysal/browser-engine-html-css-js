@@ -97,10 +97,56 @@ New samples:
   row and footer built with `display: flex`, `justify-content`,
   `align-items`, and `gap`.
 
+## M3 Status — SHIPPED
+
+Positioning, richer CSS, and real text shaping. The engine can now
+render layered, drop-shadowed UI with mixed serif/sans/mono text that
+kerns like a real browser.
+
+New in M3:
+- **`rustybuzz` text shaping** — pure-Rust port of HarfBuzz. Every
+  inline run is shaped into glyph ids + x-advances before layout, so
+  pair kerning is picked up automatically. Glyph ids flow straight
+  into `fontdue::rasterize_indexed` — shaper and rasterizer agree on
+  the same glyph table.
+- **`font-family`** with comma-separated fallback list — resolves to
+  `sans`, `serif`, or `monospace`. Three distinct TTFs are bundled so
+  the rendering actually changes.
+- **`font-style: italic`** with a real oblique face (DejaVu Sans
+  Oblique, bundled at `assets/font-italic.ttf`). `<i>`, `<em>`,
+  `<cite>`, and `<var>` default to italic.
+- **Bundled bold face** — `assets/font-bold.ttf` replaces the
+  synthetic-bold second pass for the sans family.
+- **Positioning** — `position: relative | absolute | fixed` with
+  `top`/`right`/`bottom`/`left`. Absolute boxes resolve against the
+  nearest positioned ancestor's padding box; fixed boxes against the
+  viewport. Out-of-flow boxes don't consume space in the normal flow.
+- **`z-index`** — per-subtree stacking order when painting children,
+  so later boxes can sit behind earlier ones.
+- **`opacity`** — multiplicative down the tree; applies to background,
+  borders, text, and shadows.
+- **`box-shadow`** — single outer drop shadow with offset, blur
+  (3-pass separable box blur ≈ Gaussian), spread, and color.
+
+New samples:
+- [`samples/positioned.html`](./mvp/samples/positioned.html) — a
+  stage with absolutely-positioned, z-index-stacked gradient cards,
+  a top-right pill badge (negative `top`, colored box-shadow), a
+  monospace tag, and a 75%-opacity footer panel.
+- [`samples/typography.html`](./mvp/samples/typography.html) — a
+  magazine-style article exercising serif body, monospace inline
+  code, italic pullquote and byline, real kerning at heading sizes,
+  and drop shadows on the page + pullquote.
+
+| Input | Output |
+|------|--------|
+| [`samples/positioned.html`](./mvp/samples/positioned.html) | ![positioned](./mvp/samples/positioned.png) |
+| [`samples/typography.html`](./mvp/samples/typography.html) | ![typography](./mvp/samples/typography.png) |
+
 ## Milestones
 - **M1 (Week 2):** HTML parser + DOM tree + CSS parser + selector matching — **DONE in MVP**
 - **M2 (Week 5):** borders, border-radius, flexbox-lite, inline-layout fixes — **DONE**
-- **M3 (Week 10):** Grid + broader CSS property set + real font weights (harfbuzz)
+- **M3 (Week 10):** rustybuzz shaping, font-family / italic, positioning, box-shadow, opacity, z-index — **DONE**
 - **M4 (Week 16):** JS engine (QuickJS) + DOM bindings + events
 - **M5 (Week 24):** Network stack (HTTPS) + renders 10 real websites
 
