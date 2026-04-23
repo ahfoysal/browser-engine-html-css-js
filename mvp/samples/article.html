@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { background-color: #fafafa; margin: 24px; color: #222; font-size: 17px; }
+  h1 { font-size: 36px; color: #0b5394; margin: 8px; }
+  h2 { font-size: 22px; color: #333; margin: 8px; }
+  p { margin: 10px; color: #333; }
+  .note { background-color: #fff3cd; padding: 10px; margin: 12px; color: #664d03; }
+  #author { color: #888; font-size: 14px; margin: 6px; }
+</style>
+</head>
+<body>
+  <h1>A Tiny Browser Engine</h1>
+  <p id="author">by Foysal, written as a weekend MVP.</p>
+  <h2>What it does</h2>
+  <p>It parses a small subset of HTML, applies CSS rules, lays out block and inline boxes, and paints the result to a PNG using tiny-skia for rectangles and fontdue for glyphs.</p>
+  <h2>What it doesn't do</h2>
+  <p>No flexbox, no grid, no scripting, no network. Just a straight render from HTML and CSS to pixels.</p>
+  <div class="note">
+    <p>This is a note block styled with a colored background and padding.</p>
+  </div>
+</body>
+</html>
