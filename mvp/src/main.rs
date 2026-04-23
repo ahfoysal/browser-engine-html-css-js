@@ -44,18 +44,28 @@ fn main() {
         .ok()
         .and_then(|p| std::fs::read(p).ok())
         .unwrap_or_else(|| DEFAULT_FONT.to_vec());
-    let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
+    let font = fontdue::Font::from_bytes(font_bytes.clone(), fontdue::FontSettings::default())
         .expect("font parse");
+    // Bold font: use $BROWSER_BOLD_FONT if set, else reuse regular. Paint applies
+    // a synthetic-bold second pass when the font lacks a real bold weight.
+    let bold_font_bytes = std::env::var("BROWSER_BOLD_FONT")
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or(font_bytes);
+    let bold_font =
+        fontdue::Font::from_bytes(bold_font_bytes, fontdue::FontSettings::default())
+            .expect("bold font parse");
 
     // 5. Layout
     let engine = LayoutEngine {
         viewport: Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 },
         font: &font,
+        bold_font: &bold_font,
     };
     let layout_root = engine.layout(&styled);
 
     // 6. Paint to PNG
-    let pm = paint::paint(&layout_root, width, height, &font);
+    let pm = paint::paint(&layout_root, width, height, &font, &bold_font);
     pm.save_png(&output_path).expect("save png");
     println!("rendered {} -> {} ({}x{})", input_path.display(), output_path.display(), width, height);
 }

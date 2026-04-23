@@ -1,6 +1,9 @@
-//! Block-flow layout. Each block has margin/padding, stacks vertically.
-//! Inline content within a block is laid out as lines (simple wrapping).
+//! Layout engine. M2 adds borders to the box model, flexbox-lite
+//! (`display: flex` with `flex-direction`, `justify-content`, `align-items`,
+//! `gap` — single-line only), per-line baselines, `text-align`, `line-height`,
+//! and `font-weight`.
 
+use crate::css::{Color, Value};
 use crate::style::{Display, StyledNode};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -19,10 +22,36 @@ pub struct EdgeSizes {
     pub bottom: f32,
 }
 
+/// Per-side border: width + color + style keyword (only `solid` is painted;
+/// anything else falls back to solid if width > 0).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BorderSide {
+    pub width: f32,
+    pub color: Color,
+    pub solid: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Borders {
+    pub top: BorderSide,
+    pub right: BorderSide,
+    pub bottom: BorderSide,
+    pub left: BorderSide,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Radii {
+    pub tl: f32,
+    pub tr: f32,
+    pub br: f32,
+    pub bl: f32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Dimensions {
     pub content: Rect,
     pub padding: EdgeSizes,
+    pub border: EdgeSizes,
     pub margin: EdgeSizes,
 }
 
@@ -30,8 +59,11 @@ impl Dimensions {
     pub fn padding_box(&self) -> Rect {
         expand(self.content, self.padding)
     }
+    pub fn border_box(&self) -> Rect {
+        expand(self.padding_box(), self.border)
+    }
     pub fn margin_box(&self) -> Rect {
-        expand(self.padding_box(), self.margin)
+        expand(self.border_box(), self.margin)
     }
 }
 
@@ -51,6 +83,9 @@ pub struct LayoutBox {
     pub children: Vec<LayoutBox>,
     /// Inline lines: for a block that has inline children, we build line boxes here.
     pub lines: Vec<LineBox>,
+    pub borders: Borders,
+    pub radii: Radii,
+    pub bg: Option<Color>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +98,7 @@ pub enum BoxType {
 pub struct LineBox {
     pub y: f32,
     pub height: f32,
+    pub baseline: f32,
     pub items: Vec<InlineItem>,
 }
 
@@ -70,180 +106,283 @@ pub struct LineBox {
 pub struct InlineItem {
     pub text: String,
     pub x: f32,
-    pub y: f32,        // baseline Y
+    /// Baseline Y (absolute).
+    pub y: f32,
     pub width: f32,
     pub font_size: f32,
-    pub color: crate::css::Color,
+    pub color: Color,
+    pub bold: bool,
 }
 
 fn px(node: &StyledNode, key: &str, default: f32) -> f32 {
     node.lookup(key).map(|v| v.to_px()).unwrap_or(default)
 }
 
-fn color(node: &StyledNode, key: &str, default: crate::css::Color) -> crate::css::Color {
+fn color(node: &StyledNode, key: &str, default: Color) -> Color {
+    node.lookup(key).and_then(|v| v.to_color()).unwrap_or(default)
+}
+
+fn keyword<'a>(node: &'a StyledNode, key: &str) -> Option<String> {
+    node.lookup(key).and_then(|v| v.to_keyword().map(|s| s.to_string()))
+}
+
+fn number(node: &StyledNode, key: &str, default: f32) -> f32 {
     node.lookup(key)
-        .and_then(|v| v.to_color())
+        .and_then(|v| v.to_number())
         .unwrap_or(default)
+}
+
+fn is_bold(node: &StyledNode) -> bool {
+    // font-weight keyword or number
+    if let Some(v) = node.lookup("font-weight") {
+        if let Some(n) = v.to_number() {
+            return n >= 600.0;
+        }
+        if let Some(k) = v.to_keyword() {
+            return matches!(k, "bold" | "bolder");
+        }
+    }
+    // default bold for <b>, <strong>, <h1..h6>
+    if let StyledNode::Element { tag, .. } = node {
+        return matches!(
+            tag.as_str(),
+            "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        );
+    }
+    false
+}
+
+fn resolve_borders(node: &StyledNode) -> Borders {
+    let side = |side: &str| -> BorderSide {
+        let w = node
+            .lookup(&format!("border-{}-width", side))
+            .map(|v| v.to_px())
+            .unwrap_or(0.0);
+        let c = node
+            .lookup(&format!("border-{}-color", side))
+            .and_then(|v| v.to_color())
+            .unwrap_or(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            });
+        let style = node
+            .lookup(&format!("border-{}-style", side))
+            .and_then(|v| v.to_keyword().map(|s| s.to_string()))
+            .unwrap_or_else(|| "solid".to_string());
+        let solid = style != "none" && style != "hidden" && w > 0.0;
+        BorderSide {
+            width: if solid { w } else { 0.0 },
+            color: c,
+            solid,
+        }
+    };
+    Borders {
+        top: side("top"),
+        right: side("right"),
+        bottom: side("bottom"),
+        left: side("left"),
+    }
+}
+
+fn resolve_radii(node: &StyledNode) -> Radii {
+    Radii {
+        tl: px(node, "border-top-left-radius", 0.0),
+        tr: px(node, "border-top-right-radius", 0.0),
+        br: px(node, "border-bottom-right-radius", 0.0),
+        bl: px(node, "border-bottom-left-radius", 0.0),
+    }
 }
 
 pub struct LayoutEngine<'a> {
     pub viewport: Rect,
     pub font: &'a fontdue::Font,
+    pub bold_font: &'a fontdue::Font,
 }
 
 impl<'a> LayoutEngine<'a> {
     pub fn layout(&self, root: &StyledNode) -> LayoutBox {
         let mut lb = self.build_box(root);
-        // Set root box content width to viewport
         lb.dimensions.content.x = 0.0;
         lb.dimensions.content.y = 0.0;
         lb.dimensions.content.w = self.viewport.w;
-        self.layout_block(&mut lb, &Dimensions {
-            content: Rect { x: 0.0, y: 0.0, w: self.viewport.w, h: 0.0 },
-            ..Default::default()
-        });
+        self.layout_block(
+            &mut lb,
+            &Dimensions {
+                content: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: self.viewport.w,
+                    h: 0.0,
+                },
+                ..Default::default()
+            },
+        );
         lb
     }
 
     fn build_box(&self, node: &StyledNode) -> LayoutBox {
+        let (borders, radii, bg) = match node {
+            StyledNode::Element { .. } => {
+                let bg = node
+                    .lookup("background-color")
+                    .and_then(|v| v.to_color())
+                    .or_else(|| node.lookup("background").and_then(|v| v.to_color()));
+                (resolve_borders(node), resolve_radii(node), bg)
+            }
+            _ => (Borders::default(), Radii::default(), None),
+        };
         LayoutBox {
             dimensions: Dimensions::default(),
             box_type: BoxType::Block(node.clone()),
             children: Vec::new(),
             lines: Vec::new(),
+            borders,
+            radii,
+            bg,
         }
     }
 
+    /// Core block/flex layout.
     fn layout_block(&self, lb: &mut LayoutBox, containing: &Dimensions) {
-        // Compute margins/padding & width from node.
         let node = match &lb.box_type {
             BoxType::Block(n) => n.clone(),
             BoxType::Anonymous => return,
         };
 
-        let ml = px(&node, "margin-left", px(&node, "margin", 0.0));
-        let mr = px(&node, "margin-right", px(&node, "margin", 0.0));
-        let mt = px(&node, "margin-top", px(&node, "margin", 0.0));
-        let mb = px(&node, "margin-bottom", px(&node, "margin", 0.0));
-        let pl = px(&node, "padding-left", px(&node, "padding", 0.0));
-        let pr = px(&node, "padding-right", px(&node, "padding", 0.0));
-        let pt = px(&node, "padding-top", px(&node, "padding", 0.0));
-        let pb = px(&node, "padding-bottom", px(&node, "padding", 0.0));
+        let ml = px(&node, "margin-left", 0.0);
+        let mr = px(&node, "margin-right", 0.0);
+        let mt = px(&node, "margin-top", 0.0);
+        let mb = px(&node, "margin-bottom", 0.0);
+        let pl = px(&node, "padding-left", 0.0);
+        let pr = px(&node, "padding-right", 0.0);
+        let pt = px(&node, "padding-top", 0.0);
+        let pb = px(&node, "padding-bottom", 0.0);
 
-        lb.dimensions.margin = EdgeSizes { left: ml, right: mr, top: mt, bottom: mb };
-        lb.dimensions.padding = EdgeSizes { left: pl, right: pr, top: pt, bottom: pb };
+        let bl = lb.borders.left.width;
+        let br_ = lb.borders.right.width;
+        let bt = lb.borders.top.width;
+        let bb = lb.borders.bottom.width;
 
-        // Width: fill container minus margins & padding.
+        lb.dimensions.margin = EdgeSizes {
+            left: ml,
+            right: mr,
+            top: mt,
+            bottom: mb,
+        };
+        lb.dimensions.border = EdgeSizes {
+            left: bl,
+            right: br_,
+            top: bt,
+            bottom: bb,
+        };
+        lb.dimensions.padding = EdgeSizes {
+            left: pl,
+            right: pr,
+            top: pt,
+            bottom: pb,
+        };
+
+        // Width: fill container minus all horizontal edges (or explicit width).
         let width_override = node.lookup("width").map(|v| v.to_px());
         let content_w = width_override.unwrap_or(
-            (containing.content.w - ml - mr - pl - pr).max(0.0),
+            (containing.content.w - ml - mr - bl - br_ - pl - pr).max(0.0),
         );
         lb.dimensions.content.w = content_w;
-        lb.dimensions.content.x = containing.content.x + ml + pl;
-        lb.dimensions.content.y = containing.content.y + mt + pt;
+        lb.dimensions.content.x = containing.content.x + ml + bl + pl;
+        lb.dimensions.content.y = containing.content.y + mt + bt + pt;
 
-        // Separate children into runs: if a block contains all inline children,
-        // treat them as lines within this block. Otherwise each child is a block.
-        let children_nodes: Vec<StyledNode> = if let StyledNode::Element { children, .. } = &node {
-            children.iter().filter(|c| !matches!(c, StyledNode::Element { .. } if c.display() == Display::None)).cloned().collect()
+        // Separate children into runs.
+        let raw_children: Vec<StyledNode> = if let StyledNode::Element { children, .. } = &node {
+            children
+                .iter()
+                .filter(|c| c.display() != Display::None)
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };
+        // If any sibling is block-level, drop pure-whitespace text siblings —
+        // they're just source-code indentation, not meaningful content.
+        let any_block = raw_children
+            .iter()
+            .any(|c| c.display() == Display::Block || c.display() == Display::Flex);
+        let children_nodes: Vec<StyledNode> = if any_block {
+            raw_children
+                .into_iter()
+                .filter(|c| {
+                    !matches!(c, StyledNode::Text(t) if t.trim().is_empty())
+                })
+                .collect()
+        } else {
+            raw_children
+        };
+
+        // Decide layout mode:
+        let mode = node.display();
+
+        if mode == Display::Flex {
+            self.layout_flex(lb, &node, &children_nodes);
+            // height override
+            let height_override = node.lookup("height").map(|v| v.to_px());
+            if let Some(h) = height_override {
+                lb.dimensions.content.h = h;
+            }
+            return;
+        }
 
         let all_inline = !children_nodes.is_empty()
-            && children_nodes.iter().all(|c| c.display() != Display::Block);
+            && children_nodes.iter().all(|c| c.display() == Display::Inline);
 
         let mut cursor_y = lb.dimensions.content.y;
 
         if all_inline {
-            // Build line boxes.
-            let font_size = px(&node, "font-size", 16.0);
-            let text_color = color(&node, "color", crate::css::Color { r: 17, g: 17, b: 17, a: 255 });
-            let line_height = font_size * 1.3;
-            let max_x = lb.dimensions.content.x + lb.dimensions.content.w;
-            let mut x = lb.dimensions.content.x;
-            let mut current = LineBox {
-                y: cursor_y,
-                height: line_height,
-                items: Vec::new(),
-            };
-
-            let mut push_word = |current: &mut LineBox,
-                                  cursor_y: &mut f32,
-                                  x: &mut f32,
-                                  lb: &mut LayoutBox,
-                                  word: &str,
-                                  fs: f32,
-                                  col: crate::css::Color| {
-                if word.is_empty() {
-                    return;
-                }
-                let w = measure_text(self.font, word, fs);
-                if *x + w > max_x && !current.items.is_empty() {
-                    // wrap
-                    lb.lines.push(std::mem::take(current));
-                    *cursor_y += line_height;
-                    current.y = *cursor_y;
-                    current.height = line_height;
-                    *x = lb.dimensions.content.x;
-                }
-                current.items.push(InlineItem {
-                    text: word.to_string(),
-                    x: *x,
-                    y: *cursor_y + fs, // baseline approximation
-                    width: w,
-                    font_size: fs,
-                    color: col,
-                });
-                *x += w;
-            };
-
-            for child in &children_nodes {
-                match child {
-                    StyledNode::Text(t) => {
-                        let mut first = true;
-                        for word in t.split_whitespace() {
-                            let w = if first { word.to_string() } else { format!(" {}", word) };
-                            first = false;
-                            push_word(&mut current, &mut cursor_y, &mut x, lb, &w, font_size, text_color);
-                        }
-                    }
-                    StyledNode::Element { .. } => {
-                        // inline element: pull text, use own color/font-size
-                        let fs = child.lookup("font-size").map(|v| v.to_px()).unwrap_or(font_size);
-                        let col = child.lookup("color").and_then(|v| v.to_color()).unwrap_or(text_color);
-                        let text = collect_text(child);
-                        let mut first = true;
-                        for word in text.split_whitespace() {
-                            let w = if first { word.to_string() } else { format!(" {}", word) };
-                            first = false;
-                            push_word(&mut current, &mut cursor_y, &mut x, lb, &w, fs, col);
-                        }
-                    }
-                }
-            }
-            if !current.items.is_empty() {
-                lb.lines.push(current);
-                cursor_y += line_height;
-            }
-
-            lb.dimensions.content.h = (cursor_y - lb.dimensions.content.y).max(0.0);
+            self.layout_inline(lb, &node, &children_nodes);
         } else {
-            // Block children
             for child in &children_nodes {
                 if child.display() == Display::None {
                     continue;
                 }
                 if matches!(child, StyledNode::Text(_)) {
-                    // anonymous block for stray text
-                    let t = if let StyledNode::Text(s) = child { s.clone() } else { String::new() };
-                    if t.trim().is_empty() { continue; }
-                    // Wrap text in a synthetic styled element with node's font-size/color
+                    let t = if let StyledNode::Text(s) = child {
+                        s.clone()
+                    } else {
+                        String::new()
+                    };
+                    if t.trim().is_empty() {
+                        continue;
+                    }
+                    // Wrap stray text in a synthetic inline-only block that inherits node's style.
                     let fs = px(&node, "font-size", 16.0);
-                    let col = color(&node, "color", crate::css::Color { r: 17, g: 17, b: 17, a: 255 });
+                    let col = color(
+                        &node,
+                        "color",
+                        Color {
+                            r: 17,
+                            g: 17,
+                            b: 17,
+                            a: 255,
+                        },
+                    );
                     let mut specified = std::collections::HashMap::new();
-                    specified.insert("font-size".to_string(), crate::css::Value::Length(fs, crate::css::Unit::Px));
-                    specified.insert("color".to_string(), crate::css::Value::Color(col));
+                    specified.insert(
+                        "font-size".to_string(),
+                        Value::Length(fs, crate::css::Unit::Px),
+                    );
+                    specified.insert("color".to_string(), Value::Color(col));
+                    if let Some(ta) = keyword(&node, "text-align") {
+                        specified.insert("text-align".to_string(), Value::Keyword(ta));
+                    }
+                    if let Some(lh) = node.lookup("line-height") {
+                        specified.insert("line-height".to_string(), lh.clone());
+                    }
+                    if is_bold(&node) {
+                        specified.insert(
+                            "font-weight".to_string(),
+                            Value::Keyword("bold".to_string()),
+                        );
+                    }
                     let wrap = StyledNode::Element {
                         tag: "anon".to_string(),
                         specified,
@@ -251,7 +390,12 @@ impl<'a> LayoutEngine<'a> {
                     };
                     let mut cb = self.build_box(&wrap);
                     let cont = Dimensions {
-                        content: Rect { x: lb.dimensions.content.x, y: cursor_y, w: lb.dimensions.content.w, h: 0.0 },
+                        content: Rect {
+                            x: lb.dimensions.content.x,
+                            y: cursor_y,
+                            w: lb.dimensions.content.w,
+                            h: 0.0,
+                        },
                         ..Default::default()
                     };
                     self.layout_block(&mut cb, &cont);
@@ -261,33 +405,489 @@ impl<'a> LayoutEngine<'a> {
                 }
                 let mut cb = self.build_box(child);
                 let cont = Dimensions {
-                    content: Rect { x: lb.dimensions.content.x, y: cursor_y, w: lb.dimensions.content.w, h: 0.0 },
+                    content: Rect {
+                        x: lb.dimensions.content.x,
+                        y: cursor_y,
+                        w: lb.dimensions.content.w,
+                        h: 0.0,
+                    },
                     ..Default::default()
                 };
                 self.layout_block(&mut cb, &cont);
                 cursor_y = cb.dimensions.margin_box().y + cb.dimensions.margin_box().h;
                 lb.children.push(cb);
             }
+        }
 
-            let height_override = node.lookup("height").map(|v| v.to_px());
-            lb.dimensions.content.h = height_override.unwrap_or(
-                (cursor_y - lb.dimensions.content.y).max(0.0),
-            );
+        // Content height: either override, or based on line boxes / child stacks.
+        let height_override = node.lookup("height").map(|v| v.to_px());
+        if let Some(h) = height_override {
+            lb.dimensions.content.h = h;
+        } else if !lb.lines.is_empty() {
+            // computed inside layout_inline already
+        } else if !all_inline {
+            lb.dimensions.content.h = (cursor_y - lb.dimensions.content.y).max(0.0);
+        }
+    }
+
+    /// Build line boxes from inline children.
+    fn layout_inline(&self, lb: &mut LayoutBox, node: &StyledNode, children: &[StyledNode]) {
+        let font_size = px(node, "font-size", 16.0);
+        let text_color = color(
+            node,
+            "color",
+            Color {
+                r: 17,
+                g: 17,
+                b: 17,
+                a: 255,
+            },
+        );
+        // line-height: unitless multiplier OR length in px
+        let line_height = match node.lookup("line-height") {
+            Some(Value::Number(n)) => font_size * n,
+            Some(v) => {
+                let px = v.to_px();
+                if px > 0.0 {
+                    px
+                } else {
+                    font_size * 1.3
+                }
+            }
+            None => font_size * 1.3,
+        };
+        let text_align = keyword(node, "text-align").unwrap_or_else(|| "left".to_string());
+        let parent_bold = is_bold(node);
+
+        // Flatten inline children into a token stream: Word { text, fs, col, bold }
+        struct Tok {
+            text: String,
+            fs: f32,
+            col: Color,
+            bold: bool,
+            // true if this token is just whitespace (a separator that may collapse at line breaks)
+            ws: bool,
+        }
+        fn flatten(
+            child: &StyledNode,
+            parent_fs: f32,
+            parent_col: Color,
+            parent_bold: bool,
+            out: &mut Vec<Tok>,
+        ) {
+            match child {
+                StyledNode::Text(t) => {
+                    // Per-CSS whitespace collapsing: runs of whitespace -> single space.
+                    // Emit alternating word/whitespace tokens so we can collapse at line
+                    // breaks. We preserve a leading/trailing whitespace separator token
+                    // so that inter-element spaces (e.g. the " " between </strong> and
+                    // the next text node) survive.
+                    let mut buf = String::new();
+                    let mut in_ws = false;
+                    let starts_ws = t.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+                    if starts_ws {
+                        out.push(Tok {
+                            text: " ".to_string(),
+                            fs: parent_fs,
+                            col: parent_col,
+                            bold: parent_bold,
+                            ws: true,
+                        });
+                    }
+                    for c in t.chars() {
+                        if c.is_whitespace() {
+                            if !in_ws {
+                                if !buf.is_empty() {
+                                    out.push(Tok {
+                                        text: std::mem::take(&mut buf),
+                                        fs: parent_fs,
+                                        col: parent_col,
+                                        bold: parent_bold,
+                                        ws: false,
+                                    });
+                                }
+                                in_ws = true;
+                            }
+                        } else {
+                            if in_ws && !buf.is_empty() {
+                                // already handled by flush above
+                            }
+                            if in_ws {
+                                // mid-text whitespace run -> emit a space separator
+                                // only if we've already emitted a word (so we don't
+                                // duplicate the leading-ws token).
+                                if !out
+                                    .last()
+                                    .map(|t| t.ws)
+                                    .unwrap_or(false)
+                                    && out
+                                        .last()
+                                        .map(|_| true)
+                                        .unwrap_or(false)
+                                {
+                                    // previous token was a word — add separator
+                                    let prev_was_word = out.last().map(|t| !t.ws).unwrap_or(false);
+                                    if prev_was_word {
+                                        out.push(Tok {
+                                            text: " ".to_string(),
+                                            fs: parent_fs,
+                                            col: parent_col,
+                                            bold: parent_bold,
+                                            ws: true,
+                                        });
+                                    }
+                                }
+                            }
+                            in_ws = false;
+                            buf.push(c);
+                        }
+                    }
+                    if !buf.is_empty() {
+                        out.push(Tok {
+                            text: buf,
+                            fs: parent_fs,
+                            col: parent_col,
+                            bold: parent_bold,
+                            ws: false,
+                        });
+                    }
+                    let ends_ws = t.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                    if ends_ws {
+                        // append trailing space separator (may be collapsed later)
+                        if !out.last().map(|t| t.ws).unwrap_or(false) {
+                            out.push(Tok {
+                                text: " ".to_string(),
+                                fs: parent_fs,
+                                col: parent_col,
+                                bold: parent_bold,
+                                ws: true,
+                            });
+                        }
+                    }
+                }
+                StyledNode::Element { children, .. } => {
+                    let fs = child
+                        .lookup("font-size")
+                        .map(|v| v.to_px())
+                        .unwrap_or(parent_fs);
+                    let col = child
+                        .lookup("color")
+                        .and_then(|v| v.to_color())
+                        .unwrap_or(parent_col);
+                    let bold = is_bold(child) || parent_bold;
+                    for gc in children {
+                        flatten(gc, fs, col, bold, out);
+                    }
+                }
+            }
+        }
+
+        let mut toks: Vec<Tok> = Vec::new();
+        for c in children {
+            flatten(c, font_size, text_color, parent_bold, &mut toks);
+        }
+
+        // Line break: iterate tokens, measure, wrap when exceeding content width.
+        let content_left = lb.dimensions.content.x;
+        let content_right = content_left + lb.dimensions.content.w;
+        let mut cursor_y = lb.dimensions.content.y;
+        let mut cur = LineBox {
+            y: cursor_y,
+            height: line_height,
+            baseline: cursor_y + font_size, // default
+            items: Vec::new(),
+        };
+        let mut cur_x = content_left;
+        let mut cur_max_fs: f32 = font_size;
+
+        // Close the current line and start a new one.
+        let mut lines: Vec<LineBox> = Vec::new();
+
+        let flush_line =
+            |lines: &mut Vec<LineBox>, cur: &mut LineBox, cur_max_fs: &mut f32, cursor_y: &mut f32| {
+                // trim trailing whitespace items from this line
+                while cur
+                    .items
+                    .last()
+                    .map(|it| it.text.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    cur.items.pop();
+                }
+                if !cur.items.is_empty() {
+                    // Set height to max(line_height, max font-size * 1.2)
+                    let h = line_height.max(*cur_max_fs * 1.3);
+                    cur.height = h;
+                    cur.baseline = cur.y + (*cur_max_fs).max(font_size); // place baseline just below font size
+                    // adjust each item's y to baseline
+                    let baseline = cur.baseline;
+                    for it in &mut cur.items {
+                        it.y = baseline;
+                    }
+                    lines.push(std::mem::take(cur));
+                    *cursor_y += h;
+                }
+                cur.y = *cursor_y;
+                cur.items.clear();
+                *cur_max_fs = 0.0;
+            };
+
+        for tok in &toks {
+            // Measure this token (pick bold or regular font).
+            let font = if tok.bold { self.bold_font } else { self.font };
+            let w = measure_text(font, &tok.text, tok.fs);
+            let is_leading_ws = tok.ws && cur.items.is_empty();
+            if is_leading_ws {
+                continue;
+            }
+            if cur_x + w > content_right && !cur.items.is_empty() {
+                // wrap
+                // drop trailing whitespace we'd carry into next line
+                flush_line(&mut lines, &mut cur, &mut cur_max_fs, &mut cursor_y);
+                cur_x = content_left;
+                // collapse: leading whitespace on the wrapped line is dropped
+                if tok.ws {
+                    continue;
+                }
+            }
+            cur.items.push(InlineItem {
+                text: tok.text.clone(),
+                x: cur_x,
+                y: cursor_y + tok.fs, // baseline placeholder, fixed in flush
+                width: w,
+                font_size: tok.fs,
+                color: tok.col,
+                bold: tok.bold,
+            });
+            cur_x += w;
+            if tok.fs > cur_max_fs {
+                cur_max_fs = tok.fs;
+            }
+        }
+        flush_line(&mut lines, &mut cur, &mut cur_max_fs, &mut cursor_y);
+
+        // Apply text-align to each line.
+        for line in &mut lines {
+            if line.items.is_empty() {
+                continue;
+            }
+            let first_x = line.items.first().unwrap().x;
+            let last = line.items.last().unwrap();
+            let line_w = (last.x + last.width) - first_x;
+            let slack = lb.dimensions.content.w - line_w;
+            let dx = match text_align.as_str() {
+                "center" => (slack / 2.0).max(0.0),
+                "right" => slack.max(0.0),
+                _ => 0.0,
+            };
+            if dx > 0.0 {
+                for it in &mut line.items {
+                    it.x += dx;
+                }
+            }
+        }
+
+        lb.lines = lines;
+        lb.dimensions.content.h = (cursor_y - lb.dimensions.content.y).max(0.0);
+    }
+
+    /// Flexbox-lite: single-line, horizontal or vertical, with justify-content,
+    /// align-items, and gap. No wrap, no flex-grow/shrink (M2 scope).
+    fn layout_flex(&self, lb: &mut LayoutBox, node: &StyledNode, children: &[StyledNode]) {
+        let direction = keyword(node, "flex-direction").unwrap_or_else(|| "row".to_string());
+        let row = direction != "column" && direction != "column-reverse";
+        let justify = keyword(node, "justify-content").unwrap_or_else(|| "flex-start".to_string());
+        let align = keyword(node, "align-items").unwrap_or_else(|| "stretch".to_string());
+        let gap = px(node, "gap", 0.0);
+
+        // First, lay out each child as a block in a 0-origin container, so we
+        // know their intrinsic sizes. Then reposition along the main axis.
+        let mut boxes: Vec<LayoutBox> = Vec::new();
+        for child in children {
+            if matches!(child, StyledNode::Text(_)) {
+                continue;
+            }
+            let has_explicit_width = child.lookup("width").is_some();
+            let mut cb = self.build_box(child);
+            let cont = Dimensions {
+                content: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: lb.dimensions.content.w,
+                    h: 0.0,
+                },
+                ..Default::default()
+            };
+            self.layout_block(&mut cb, &cont);
+            // Flex children without explicit width: shrink-to-fit.
+            if !has_explicit_width {
+                let intrinsic = intrinsic_content_width(&cb);
+                if intrinsic > 0.0 && intrinsic < cb.dimensions.content.w {
+                    // Re-layout at the shrunk width so wrapping and children are correct.
+                    let new_w = intrinsic;
+                    let mut cb2 = self.build_box(child);
+                    let cont2 = Dimensions {
+                        content: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: new_w
+                                + cb.dimensions.padding.left
+                                + cb.dimensions.padding.right
+                                + cb.dimensions.border.left
+                                + cb.dimensions.border.right
+                                + cb.dimensions.margin.left
+                                + cb.dimensions.margin.right,
+                            h: 0.0,
+                        },
+                        ..Default::default()
+                    };
+                    self.layout_block(&mut cb2, &cont2);
+                    cb = cb2;
+                }
+            }
+            boxes.push(cb);
+        }
+
+        let n = boxes.len();
+        if n == 0 {
+            lb.dimensions.content.h = 0.0;
+            return;
+        }
+
+        let total_gap = gap * (n as f32 - 1.0).max(0.0);
+        let container_w = lb.dimensions.content.w;
+        let (main_total, cross_max) = if row {
+            let tot: f32 = boxes.iter().map(|b| b.dimensions.margin_box().w).sum();
+            let cross: f32 = boxes
+                .iter()
+                .map(|b| b.dimensions.margin_box().h)
+                .fold(0.0_f32, f32::max);
+            (tot + total_gap, cross)
+        } else {
+            let tot: f32 = boxes.iter().map(|b| b.dimensions.margin_box().h).sum();
+            let cross: f32 = boxes
+                .iter()
+                .map(|b| b.dimensions.margin_box().w)
+                .fold(0.0_f32, f32::max);
+            (tot + total_gap, cross)
+        };
+
+        // Container cross size: explicit height for row, width for column; else content-max.
+        let container_h = node
+            .lookup("height")
+            .map(|v| v.to_px())
+            .unwrap_or_else(|| if row { cross_max } else { main_total });
+        if row {
+            lb.dimensions.content.h = container_h;
+        } else {
+            lb.dimensions.content.h = container_h;
+        }
+
+        // Compute starting offset along main axis for justify-content.
+        let available = if row {
+            container_w - main_total
+        } else {
+            container_h - main_total
+        };
+        let (start_offset, between_extra) = match justify.as_str() {
+            "flex-end" | "end" => (available.max(0.0), 0.0),
+            "center" => ((available / 2.0).max(0.0), 0.0),
+            "space-between" if n > 1 => (0.0, available.max(0.0) / (n as f32 - 1.0)),
+            "space-around" if n > 0 => {
+                let each = available.max(0.0) / n as f32;
+                (each / 2.0, each)
+            }
+            "space-evenly" if n > 0 => {
+                let each = available.max(0.0) / (n as f32 + 1.0);
+                (each, each)
+            }
+            _ => (0.0, 0.0),
+        };
+
+        // Place each child.
+        let origin_x = lb.dimensions.content.x;
+        let origin_y = lb.dimensions.content.y;
+        let mut main_cursor = if row { origin_x } else { origin_y } + start_offset;
+
+        for mut cb in boxes.into_iter() {
+            let mb = cb.dimensions.margin_box();
+            let (main_size, cross_size) = if row { (mb.w, mb.h) } else { (mb.h, mb.w) };
+
+            // Cross-axis alignment:
+            let cross_start = if row { origin_y } else { origin_x };
+            let cross_extent = if row { container_h } else { container_w };
+            let cross_offset = match align.as_str() {
+                "flex-end" | "end" => (cross_extent - cross_size).max(0.0),
+                "center" => ((cross_extent - cross_size) / 2.0).max(0.0),
+                "stretch" => 0.0, // size stretching not implemented for M2; top-align
+                _ => 0.0,
+            };
+
+            // The child was laid out at origin (0,0) with its own margin. We
+            // translate it so its margin-box starts at the desired spot.
+            let desired_main = main_cursor;
+            let desired_cross = cross_start + cross_offset;
+            let (dx, dy) = if row {
+                (desired_main - mb.x, desired_cross - mb.y)
+            } else {
+                (desired_cross - mb.x, desired_main - mb.y)
+            };
+            translate_box(&mut cb, dx, dy);
+
+            main_cursor += main_size + gap + between_extra;
+            lb.children.push(cb);
         }
     }
 }
 
-fn collect_text(n: &StyledNode) -> String {
-    let mut s = String::new();
-    match n {
-        StyledNode::Text(t) => s.push_str(t),
-        StyledNode::Element { children, .. } => {
-            for c in children {
-                s.push_str(&collect_text(c));
-            }
+/// Recursively translate a laid-out box and everything inside it.
+fn translate_box(lb: &mut LayoutBox, dx: f32, dy: f32) {
+    lb.dimensions.content.x += dx;
+    lb.dimensions.content.y += dy;
+    for line in &mut lb.lines {
+        line.y += dy;
+        line.baseline += dy;
+        for it in &mut line.items {
+            it.x += dx;
+            it.y += dy;
         }
     }
-    s
+    for c in &mut lb.children {
+        translate_box(c, dx, dy);
+    }
+}
+
+/// Maximum content width used by this laid-out box, measured from the
+/// actual inline lines and child margin-boxes. Used by flex to shrink
+/// children without an explicit `width`.
+fn intrinsic_content_width(lb: &LayoutBox) -> f32 {
+    let mut max_w: f32 = 0.0;
+    let origin = lb.dimensions.content.x;
+    for line in &lb.lines {
+        let w = line
+            .items
+            .iter()
+            .map(|it| (it.x + it.width) - origin)
+            .fold(0.0_f32, f32::max);
+        if w > max_w {
+            max_w = w;
+        }
+    }
+    for c in &lb.children {
+        // child's margin-box width relative to this content
+        let mb = c.dimensions.margin_box();
+        let w = (mb.x + mb.w) - origin;
+        if w > max_w {
+            max_w = w;
+        }
+        // also consider the child's own intrinsic width (in case its
+        // explicit content width is wider than where it currently sits)
+        let child_intrinsic = intrinsic_content_width(c);
+        if child_intrinsic > max_w {
+            max_w = child_intrinsic;
+        }
+    }
+    max_w
 }
 
 pub fn measure_text(font: &fontdue::Font, text: &str, size: f32) -> f32 {

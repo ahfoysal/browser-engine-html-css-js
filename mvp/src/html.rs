@@ -114,15 +114,23 @@ impl Parser {
 
     fn parse_text(&mut self) -> Node {
         let text = self.consume_while(|c| c != '<');
-        // collapse whitespace
-        let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let collapsed = if text.chars().next().map(|c| c.is_whitespace()).unwrap_or(false)
-            && !collapsed.is_empty()
-        {
-            format!(" {}", collapsed)
-        } else {
-            collapsed
-        };
+        // Collapse whitespace runs to a single space, but preserve whether the
+        // text starts / ends with whitespace — those boundary spaces are how
+        // inline content connects across element boundaries (<strong>A</strong> b).
+        let leading_ws = text.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+        let trailing_ws = text.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+        let mut collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            if leading_ws {
+                collapsed.insert(0, ' ');
+            }
+            if trailing_ws {
+                collapsed.push(' ');
+            }
+        } else if leading_ws || trailing_ws {
+            // Pure-whitespace text between inline siblings collapses to a single space.
+            collapsed = " ".to_string();
+        }
         Node::Text(collapsed)
     }
 
@@ -256,7 +264,7 @@ impl Parser {
             } else {
                 let t = self.parse_text();
                 if let Node::Text(ref s) = t {
-                    if !s.trim().is_empty() {
+                    if !s.is_empty() {
                         nodes.push(t);
                     }
                 }
