@@ -10,6 +10,7 @@ tiny-skia = "0.11"
 fontdue = "0.9"
 png = "0.17"
 rustybuzz = "0.14"
+rquickjs = { version = "0.11", features = ["macro"] }
 
 [profile.release]
 opt-level = 3

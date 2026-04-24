@@ -210,11 +210,18 @@ impl Parser {
                     self.consume_char();
                 }
             }
-            let children = if tag == "style" {
-                vec![Node::Text(text)]
+            let (children, mut attrs) = if tag == "style" {
+                (vec![Node::Text(text)], attrs)
             } else {
-                vec![]
+                // For <script>, stash the raw source in a synthetic attribute
+                // so the JS runtime can collect it after parse. Layout/paint
+                // ignores script elements regardless.
+                let mut a = attrs;
+                a.insert("__script_src".to_string(), text);
+                (vec![], a)
             };
+            // Silence unused-mut warning when tag == "style".
+            let _ = &mut attrs;
             return Some(Node::Element(Element {
                 tag,
                 attrs,
