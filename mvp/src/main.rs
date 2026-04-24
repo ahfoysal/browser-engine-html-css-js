@@ -18,6 +18,7 @@ mod layout;
 mod paint;
 mod text;
 mod js;
+mod net;
 
 use std::path::{Path, PathBuf};
 
@@ -37,12 +38,45 @@ fn main() {
         eprintln!("usage: {} input.html output.png [width] [height]", args[0]);
         std::process::exit(1);
     }
-    let input_path = PathBuf::from(&args[1]);
+    let input_arg = &args[1];
     let output_path = PathBuf::from(&args[2]);
     let width: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(800);
     let height: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
 
-    let html_text = std::fs::read_to_string(&input_path).expect("read input html");
+    // `input_arg` may be a local file path or an http(s):// URL. In the
+    // URL case we fetch the HTML body and also plumb a `Fetcher` through
+    // so the inliner can pull external stylesheets / scripts / images.
+    let is_url = input_arg.starts_with("http://") || input_arg.starts_with("https://");
+    let (html_text, base_url, fetcher, input_display): (
+        String,
+        Option<String>,
+        Option<net::Fetcher>,
+        PathBuf,
+    ) = if is_url {
+        let fetcher = net::Fetcher::new().expect("init fetcher");
+        let fetched = fetcher
+            .fetch_text(input_arg)
+            .unwrap_or_else(|e| panic!("fetch {}: {}", input_arg, e));
+        eprintln!(
+            "[net] fetched {} ({} bytes, {})",
+            fetched.final_url,
+            fetched.body.len(),
+            if fetched.from_cache { "cache" } else { "fresh" }
+        );
+        let final_url = fetched.final_url.clone();
+        (
+            fetched.as_text(),
+            Some(final_url),
+            Some(fetcher),
+            PathBuf::from(input_arg),
+        )
+    } else {
+        let input_path = PathBuf::from(input_arg);
+        let t = std::fs::read_to_string(&input_path).expect("read input html");
+        (t, None, None, input_path)
+    };
+
+    let input_path = input_display;
 
     // Load fonts once — re-used for every render pass.
     let sans_bytes = load_bytes("BROWSER_FONT", FONT_SANS);
@@ -81,7 +115,16 @@ fn main() {
     };
 
     // 1. Parse HTML
-    let parsed = html::parse(&html_text);
+    let mut parsed = html::parse(&html_text);
+
+    // 1.5. If we were given a URL, pull external stylesheets, inline
+    //     external <script src>, and pre-fetch <img> resources. The
+    //     accumulated CSS is stashed as extra text we'll mix into the
+    //     stylesheet pass in `render`.
+    let extra_css: String = match (&base_url, &fetcher) {
+        (Some(base), Some(f)) => net::inline_external_resources(&mut parsed, base, f),
+        _ => String::new(),
+    };
 
     // 1a. JS pass.
     let working = js::Dom::from_html(&parsed);
@@ -100,7 +143,7 @@ fn main() {
         }
 
         let initial = runtime.dom.borrow().to_html();
-        render(&initial, &output_path, width, height, &fonts, &input_path);
+        render(&initial, &output_path, width, height, &fonts, &input_path, &extra_css);
 
         if let Ok(id) = std::env::var("BROWSER_CLICK") {
             let nid_opt = runtime.dom.borrow().get_by_id(&id);
@@ -114,7 +157,7 @@ fn main() {
                 }
                 let after = runtime.dom.borrow().to_html();
                 let after_path = append_suffix(&output_path, "-after");
-                render(&after, &after_path, width, height, &fonts, &input_path);
+                render(&after, &after_path, width, height, &fonts, &input_path, &extra_css);
             } else {
                 eprintln!("[js] BROWSER_CLICK target '#{}' not found", id);
             }
@@ -125,7 +168,7 @@ fn main() {
         return;
     }
 
-    render(&parsed, &output_path, width, height, &fonts, &input_path);
+    render(&parsed, &output_path, width, height, &fonts, &input_path, &extra_css);
 }
 
 fn render(
@@ -135,9 +178,14 @@ fn render(
     height: u32,
     fonts: &FontSet,
     input_path: &Path,
+    extra_css: &str,
 ) {
     let mut css_text = String::from(style::user_agent_css());
     css_text.push_str(&html::extract_styles(dom));
+    if !extra_css.is_empty() {
+        css_text.push('\n');
+        css_text.push_str(extra_css);
+    }
     let stylesheet = css::parse(&css_text);
     let styled = style::style_tree(dom, &stylesheet);
     let engine = LayoutEngine {

@@ -143,12 +143,64 @@ New samples:
 | [`samples/positioned.html`](./mvp/samples/positioned.html) | ![positioned](./mvp/samples/positioned.png) |
 | [`samples/typography.html`](./mvp/samples/typography.html) | ![typography](./mvp/samples/typography.png) |
 
+## M5 Status — SHIPPED
+
+The engine now talks HTTPS. Given a URL on the command line, it fetches
+the document, pulls any external stylesheets and `<script src>`, warms
+the image cache, and renders the result to PNG — end-to-end, no
+pre-saved HTML required.
+
+New in M5:
+- **`reqwest` + `rustls`** HTTPS stack (pure-Rust TLS, no system
+  OpenSSL). Up to 10 redirect hops. gzip transfer decoding.
+- **In-memory cookie jar** shared across all requests on a
+  single `Fetcher`, so sites that bounce through a cookie-setting
+  redirect land cleanly.
+- **Content-addressed on-disk cache** — `sha256(url) -> body`, stored
+  under `./.netcache/<hex>.bin` with the content-type side-car in
+  `<hex>.ct`. Identical URLs re-use the cached body forever (until the
+  user `rm -rf`s the dir), so re-running a render is zero-network and
+  hermetic.
+- **Resource inlining** — walks the parsed DOM post-fetch, follows
+  every `<link rel="stylesheet" href>`, appends the fetched CSS into
+  the stylesheet pass, and swaps `<script src>` elements' source
+  content in place so the M4 QuickJS runtime picks them up. `<img>`
+  resources are pre-fetched (cache warmed) even though the paint pass
+  still draws empty boxes for them.
+- **CLI accepts URLs** — `./browser-engine-mvp <url-or-file> out.png
+  [w] [h]`. The URL branch runs the fetch + inline pipeline, then hands
+  the same DOM off to the existing layout/paint path.
+
+### Five real websites, rendered end-to-end
+
+All PNGs below came from `./browser-engine-mvp <url> <png>`. No local
+copies of the HTML; the engine fetched, parsed, styled, and painted
+each one on a cold cache. Totals in parens are the fetched HTML body
+size.
+
+| URL | Output | Body |
+|---|---|---|
+| [`https://example.com`](https://example.com) | ![example.com](./mvp/samples/urls/example-com.png) | 528 B |
+| [`https://example.org`](https://example.org) | ![example.org](./mvp/samples/urls/example-org.png) | 528 B |
+| [`https://motherfuckingwebsite.com`](https://motherfuckingwebsite.com) | ![mfwebsite](./mvp/samples/urls/mfwebsite.png) | 4.9 KB |
+| [`https://info.cern.ch`](https://info.cern.ch) | ![cern](./mvp/samples/urls/cern.png) | 646 B |
+| [GitHub raw README](https://raw.githubusercontent.com/ahfoysal/browser-engine-html-css-js/main/README.md) | ![readme](./mvp/samples/urls/readme.png) | 7.4 KB |
+
+### What doesn't work yet
+- No actual image rasterization — `<img>` still paints an empty box.
+- Cookie jar is session-only (in-memory).
+- No `Cache-Control` / conditional GETs; the on-disk cache is
+  fetched-once-forever until you `rm -rf .netcache`.
+- HTML parser is still the weekend tokenizer, so gnarly real-world
+  pages (GitHub, Twitter, ...) time out or misparse. The five targets
+  above were picked specifically because they're tiny and well-formed.
+
 ## Milestones
 - **M1 (Week 2):** HTML parser + DOM tree + CSS parser + selector matching — **DONE in MVP**
 - **M2 (Week 5):** borders, border-radius, flexbox-lite, inline-layout fixes — **DONE**
 - **M3 (Week 10):** rustybuzz shaping, font-family / italic, positioning, box-shadow, opacity, z-index — **DONE**
-- **M4 (Week 16):** JS engine (QuickJS) + DOM bindings + events
-- **M5 (Week 24):** Network stack (HTTPS) + renders 10 real websites
+- **M4 (Week 16):** JS engine (QuickJS) + DOM bindings + events — **DONE**
+- **M5 (Week 24):** Network stack (HTTPS) + renders real websites — **DONE**
 
 ## Key References
 - "Let's build a browser engine!" (Matt Brubeck)
