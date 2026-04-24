@@ -21,8 +21,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
@@ -80,10 +80,42 @@ impl Fetched {
     }
 }
 
+/// One entry in the DevTools network panel.
+#[derive(Debug, Clone)]
+pub struct NetEntry {
+    pub url: String,
+    pub status: u16,
+    pub bytes: usize,
+    pub from_cache: bool,
+    pub duration_ms: u64,
+    pub http_version: String,
+}
+
+/// Shared log of all requests — used by the DevTools overlay.
+#[derive(Debug, Default, Clone)]
+pub struct NetLog {
+    pub inner: Arc<Mutex<Vec<NetEntry>>>,
+}
+
+impl NetLog {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(Mutex::new(Vec::new())) }
+    }
+    pub fn push(&self, e: NetEntry) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.push(e);
+        }
+    }
+    pub fn entries(&self) -> Vec<NetEntry> {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 /// Shared HTTP client + cookie jar + on-disk cache.
 pub struct Fetcher {
     client: Client,
     cache_dir: PathBuf,
+    pub log: NetLog,
 }
 
 impl Fetcher {
@@ -97,18 +129,22 @@ impl Fetcher {
         // `.cookie_store(true)` — in-memory, shared across all requests on
         // this Client, which is exactly the "single-domain in-memory jar"
         // the spec asks for (actually all-domain, but close enough).
+        // M6: enable HTTP/2 via ALPN negotiation. We still accept HTTP/1.1
+        // servers — reqwest will fall back when the peer doesn't offer h2.
         let client = Client::builder()
             .cookie_store(true)
             .redirect(Policy::limited(10))
             .timeout(Duration::from_secs(20))
+            .http2_adaptive_window(true)
             .user_agent(
-                "BrowserEngineMVP/0.5 (+https://github.com/ahfoysal/browser-engine-html-css-js)",
+                "BrowserEngineMVP/0.6 (+https://github.com/ahfoysal/browser-engine-html-css-js)",
             )
             .build()?;
 
         Ok(Fetcher {
             client,
             cache_dir,
+            log: NetLog::new(),
         })
     }
 
@@ -131,10 +167,19 @@ impl Fetcher {
 
     /// GET `url`, honoring cache. Returns body + content-type.
     pub fn fetch_bytes(&self, url: &str) -> Result<Fetched, NetError> {
+        let started = Instant::now();
         let (body_path, ct_path) = self.cache_paths(url);
         if body_path.exists() {
             let body = fs::read(&body_path)?;
             let content_type = fs::read_to_string(&ct_path).unwrap_or_default();
+            self.log.push(NetEntry {
+                url: url.to_string(),
+                status: 200,
+                bytes: body.len(),
+                from_cache: true,
+                duration_ms: started.elapsed().as_millis() as u64,
+                http_version: "cache".into(),
+            });
             return Ok(Fetched {
                 final_url: url.to_string(),
                 content_type,
@@ -146,8 +191,17 @@ impl Fetcher {
         eprintln!("[net] GET {}", url);
         let resp = self.client.get(url).send()?;
         let status = resp.status();
+        let http_version = format!("{:?}", resp.version());
         let final_url = resp.url().to_string();
         if !status.is_success() {
+            self.log.push(NetEntry {
+                url: final_url.clone(),
+                status: status.as_u16(),
+                bytes: 0,
+                from_cache: false,
+                duration_ms: started.elapsed().as_millis() as u64,
+                http_version,
+            });
             return Err(NetError::Http(format!("{} -> HTTP {}", url, status)));
         }
         let content_type = resp
@@ -161,6 +215,15 @@ impl Fetcher {
         // Write-through to cache (best effort).
         let _ = fs::write(&body_path, &body);
         let _ = fs::write(&ct_path, content_type.as_bytes());
+
+        self.log.push(NetEntry {
+            url: final_url.clone(),
+            status: status.as_u16(),
+            bytes: body.len(),
+            from_cache: false,
+            duration_ms: started.elapsed().as_millis() as u64,
+            http_version,
+        });
 
         Ok(Fetched {
             final_url,

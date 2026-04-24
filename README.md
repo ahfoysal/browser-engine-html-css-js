@@ -195,12 +195,68 @@ size.
   pages (GitHub, Twitter, ...) time out or misparse. The five targets
   above were picked specifically because they're tiny and well-formed.
 
+## M6 Status — SHIPPED
+
+M6 upgrades the JS engine from a single-pass "run + drain FIFO" to a
+proper browser-style event loop, wires up `fetch()`, turns on HTTP/2,
+and adds an in-output **DevTools panel**.
+
+New in M6:
+- **Real event loop.** Every `eval` / timer / event dispatch is
+  followed by a microtask drain via `rt.execute_pending_job()` so
+  `Promise.then` / `.catch` / chained `.then()`s settle in spec order,
+  before any macrotask runs.
+- **Timers with virtual time.** `setTimeout` / `setInterval` register
+  into a `TimerQueue` keyed by due-time on an accumulated virtual
+  clock. `drain_tasks(max_virtual_ms)` advances the clock to each
+  earliest deadline in turn, runs the callback, then drains its
+  microtasks — repeat until the queue is empty or the budget is
+  exceeded. That's what lets `setTimeout(..., 500)` actually "happen"
+  in a one-shot render.
+- **`queueMicrotask`, `clearTimeout`, `clearInterval`, `setInterval`.**
+- **`fetch(url)`.** Returns a real `Promise<Response>` with `text()` /
+  `json()` / `ok` / `status`. Body is fetched through the same Rust
+  `Fetcher` used for `<link>` / `<script src>`, so cache + cookies are
+  shared. The resolution is queued as a microtask so `.then()` chains
+  naturally.
+- **HTTP/2.** `reqwest` is built with the `http2` feature and
+  `http2_adaptive_window(true)` — servers that advertise `h2` over ALPN
+  speak HTTP/2, others fall back transparently. Observed in the sample
+  as `HTTP/2.0 200` on `example.com`.
+- **DevTools panel overlay.** Set `BROWSER_DEVTOOLS=1` and the output
+  PNG gains a bottom panel split into three columns: **Elements** (the
+  final DOM after JS), **Network** (one row per request with status,
+  bytes, duration, protocol), and **Console** (captured `console.log`).
+  Rendered straight onto the pixmap by `src/devtools.rs` with a
+  fontdue coverage blit — no layout engine involved.
+
+### Sample
+
+```bash
+cd mvp
+BROWSER_DEVTOOLS=1 ./target/release/browser-engine-mvp \
+  samples/m6_fetch.html samples/m6_fetch.png 800 600
+```
+
+| Input | Output |
+|------|------|
+| [`samples/m6_fetch.html`](./mvp/samples/m6_fetch.html) | ![m6 fetch](./mvp/samples/m6_fetch.png) |
+
+The sample fires three things in parallel: a Promise `.then` chain
+(synchronous microtask resolution), a `setInterval(..., 100)` that
+tick-counts 5 times and cancels itself via `clearInterval`, and a
+`setTimeout(..., 500)` that calls `fetch("https://example.com/")`,
+awaits its body, and writes the HTML `<title>` ("Example Domain") into
+the DOM. The devtools panel shows the fetch logged as `HTTP/2.0 200
+528B`.
+
 ## Milestones
 - **M1 (Week 2):** HTML parser + DOM tree + CSS parser + selector matching — **DONE in MVP**
 - **M2 (Week 5):** borders, border-radius, flexbox-lite, inline-layout fixes — **DONE**
 - **M3 (Week 10):** rustybuzz shaping, font-family / italic, positioning, box-shadow, opacity, z-index — **DONE**
 - **M4 (Week 16):** JS engine (QuickJS) + DOM bindings + events — **DONE**
 - **M5 (Week 24):** Network stack (HTTPS) + renders real websites — **DONE**
+- **M6 (Week 30):** real JS event loop (Promise/setTimeout) + `fetch()` + HTTP/2 + DevTools panel — **DONE**
 
 ## Key References
 - "Let's build a browser engine!" (Matt Brubeck)

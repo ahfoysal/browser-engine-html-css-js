@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+<style>
+  body { font-family: sans-serif; margin: 24px; color: #222; background: #fafafa; }
+  h1 { font-size: 28px; margin: 0 0 12px 0; color: #0b5fb5; }
+  .card {
+    border: 1px solid #d5d8de;
+    border-radius: 10px;
+    padding: 16px 18px;
+    background: #ffffff;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+  }
+  .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.06em; }
+  .value { font-size: 18px; font-weight: bold; color: #111; margin-top: 4px; }
+  .status { font-size: 13px; color: #555; margin-top: 6px; }
+  .ok { color: #0b8f3a; }
+</style>
+</head>
+<body>
+  <h1>M6: async fetch + real event loop</h1>
+
+  <div class="card">
+    <div class="label">Tick counter (setInterval 100ms)</div>
+    <div class="value" id="ticks">0</div>
+    <div class="status">Incremented by setInterval — driven by the virtual clock.</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Promise chain (microtasks)</div>
+    <div class="value" id="chain">pending...</div>
+    <div class="status">Resolves through 3 .then() stages before any timer fires.</div>
+  </div>
+
+  <div class="card">
+    <div class="label">fetch() result (setTimeout 500ms)</div>
+    <div class="value" id="fetched">(loading)</div>
+    <div class="status" id="fetched-status">waiting on setTimeout + fetch promise</div>
+  </div>
+
+<script>
+  // Microtask chain — must resolve before any timer callback runs.
+  Promise.resolve(1)
+    .then(v => v + 1)
+    .then(v => v * 10)
+    .then(v => {
+      document.getElementById('chain').textContent = 'resolved: ' + v;
+      console.log('chain resolved ->', v);
+    });
+
+  // setInterval driving the DOM.
+  let n = 0;
+  const iv = setInterval(() => {
+    n++;
+    document.getElementById('ticks').textContent = String(n);
+    if (n >= 5) {
+      clearInterval(iv);
+      console.log('interval cancelled at', n);
+    }
+  }, 100);
+
+  // setTimeout that kicks off a fetch().
+  setTimeout(() => {
+    console.log('500ms timer fired, calling fetch()');
+    fetch('https://example.com/')
+      .then(r => {
+        console.log('response ok=' + r.ok + ' status=' + r.status);
+        return r.text();
+      })
+      .then(body => {
+        // Pull the <title> out of the body so we show something meaningful.
+        const m = body.match(/<title>([^<]*)<\/title>/i);
+        const label = m ? m[1] : ('received ' + body.length + ' bytes');
+        document.getElementById('fetched').textContent = label;
+        const s = document.getElementById('fetched-status');
+        s.textContent = 'fetched ' + body.length + ' bytes via HTTP/2';
+        s.setAttribute('class', 'status ok');
+        console.log('fetch done, body bytes=' + body.length);
+      })
+      .catch(e => {
+        document.getElementById('fetched').textContent = 'fetch failed';
+        console.log('fetch error', String(e));
+      });
+  }, 500);
+
+  console.log('script top done — scheduling microtasks + timers');
+</script>
+</body>
+</html>
