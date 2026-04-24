@@ -19,8 +19,10 @@ mod paint;
 mod text;
 mod js;
 mod net;
+mod devtools;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use layout::{FontFace, FontSet, LayoutEngine, Rect};
 
@@ -130,20 +132,47 @@ fn main() {
     let working = js::Dom::from_html(&parsed);
     let has_scripts = !working.scripts.is_empty();
 
+    // Share the same fetcher with the JS runtime so page-side `fetch()`
+    // reuses the cache + cookie jar and lands in the devtools network log.
+    // If the input was a local file (no fetcher yet) we still spin one up
+    // for JS `fetch()` calls — offline sandboxes will just log an error.
+    let shared_fetcher: Option<Rc<net::Fetcher>> = fetcher
+        .map(Rc::new)
+        .or_else(|| net::Fetcher::new().ok().map(Rc::new));
+
     if has_scripts {
         let scripts = working.scripts.clone();
-        let runtime = js::JsRuntime::new(working).expect("create js runtime");
+        let runtime = js::JsRuntime::new_with_fetcher(working, shared_fetcher.clone())
+            .expect("create js runtime");
         for src in &scripts {
             if let Err(e) = runtime.eval(src) {
                 eprintln!("[js] script error: {:?}", e);
             }
         }
-        if let Err(e) = runtime.drain_timers() {
-            eprintln!("[js] timer error: {:?}", e);
+        // M6: advance up to 2000ms of virtual time so setTimeout callbacks
+        // (and the microtasks they schedule) actually fire before we
+        // render. `fetch()` chains complete during this drain too.
+        if let Err(e) = runtime.drain_tasks(2000) {
+            eprintln!("[js] task-loop error: {:?}", e);
         }
 
         let initial = runtime.dom.borrow().to_html();
-        render(&initial, &output_path, width, height, &fonts, &input_path, &extra_css);
+        let console_lines = runtime.console.borrow().lines.clone();
+        let net_entries = shared_fetcher
+            .as_ref()
+            .map(|f| f.log.entries())
+            .unwrap_or_default();
+        render_with_devtools(
+            &initial,
+            &output_path,
+            width,
+            height,
+            &fonts,
+            &input_path,
+            &extra_css,
+            &net_entries,
+            &console_lines,
+        );
 
         if let Ok(id) = std::env::var("BROWSER_CLICK") {
             let nid_opt = runtime.dom.borrow().get_by_id(&id);
@@ -152,12 +181,27 @@ fn main() {
                     Ok(n) => println!("[js] dispatched click -> #{} ({} listener(s))", id, n),
                     Err(e) => eprintln!("[js] dispatch error: {:?}", e),
                 }
-                if let Err(e) = runtime.drain_timers() {
-                    eprintln!("[js] post-click timer error: {:?}", e);
+                if let Err(e) = runtime.drain_tasks(2000) {
+                    eprintln!("[js] post-click task-loop error: {:?}", e);
                 }
                 let after = runtime.dom.borrow().to_html();
                 let after_path = append_suffix(&output_path, "-after");
-                render(&after, &after_path, width, height, &fonts, &input_path, &extra_css);
+                let console_lines = runtime.console.borrow().lines.clone();
+                let net_entries = shared_fetcher
+                    .as_ref()
+                    .map(|f| f.log.entries())
+                    .unwrap_or_default();
+                render_with_devtools(
+                    &after,
+                    &after_path,
+                    width,
+                    height,
+                    &fonts,
+                    &input_path,
+                    &extra_css,
+                    &net_entries,
+                    &console_lines,
+                );
             } else {
                 eprintln!("[js] BROWSER_CLICK target '#{}' not found", id);
             }
@@ -168,7 +212,75 @@ fn main() {
         return;
     }
 
-    render(&parsed, &output_path, width, height, &fonts, &input_path, &extra_css);
+    let net_entries = shared_fetcher
+        .as_ref()
+        .map(|f| f.log.entries())
+        .unwrap_or_default();
+    render_with_devtools(
+        &parsed,
+        &output_path,
+        width,
+        height,
+        &fonts,
+        &input_path,
+        &extra_css,
+        &net_entries,
+        &[],
+    );
+}
+
+fn devtools_enabled() -> bool {
+    std::env::var("BROWSER_DEVTOOLS")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_with_devtools(
+    dom: &html::Node,
+    output_path: &Path,
+    width: u32,
+    height: u32,
+    fonts: &FontSet,
+    input_path: &Path,
+    extra_css: &str,
+    net_entries: &[net::NetEntry],
+    console_lines: &[String],
+) {
+    if !devtools_enabled() {
+        render(dom, output_path, width, height, fonts, input_path, extra_css);
+        return;
+    }
+
+    let mut css_text = String::from(style::user_agent_css());
+    css_text.push_str(&html::extract_styles(dom));
+    if !extra_css.is_empty() {
+        css_text.push('\n');
+        css_text.push_str(extra_css);
+    }
+    let stylesheet = css::parse(&css_text);
+    let styled = style::style_tree(dom, &stylesheet);
+    let engine = LayoutEngine {
+        viewport: Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 },
+        fonts,
+    };
+    let layout_root = engine.layout(&styled);
+    let pm = paint::paint(&layout_root, width, height, fonts);
+
+    let data = devtools::DevToolsData {
+        dom,
+        network: net_entries,
+        console: console_lines,
+    };
+    devtools::save_with_panel(&pm, &data, fonts.sans.fontdue, output_path)
+        .expect("save png with devtools");
+    println!(
+        "rendered {} -> {} ({}x{} + devtools)",
+        input_path.display(),
+        output_path.display(),
+        width,
+        height
+    );
 }
 
 fn render(
